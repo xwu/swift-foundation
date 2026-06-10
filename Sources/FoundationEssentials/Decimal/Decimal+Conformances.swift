@@ -144,25 +144,11 @@ extension Decimal /* : FloatingPoint */ {
     /// Creates and initializes a decimal with the provided unsigned integer value.
     public init(_ value: UInt64) {
         self = Decimal()
-        if value == 0 {
-            return
-        }
-
-        var compactValue = value
-        var exponent: Int32 = 0
-        while compactValue % 10 == 0 {
-            compactValue /= 10
-            exponent += 1
-        }
-        _isCompact = 1
-        _exponent = exponent
-
-        let wordCount = ((UInt64.bitWidth - compactValue.leadingZeroBitCount) + (UInt16.bitWidth - 1)) / UInt16.bitWidth
-        _length = UInt32(wordCount)
-        _mantissa.0 = UInt16(truncatingIfNeeded: compactValue >> 0)
-        _mantissa.1 = UInt16(truncatingIfNeeded: compactValue >> 16)
-        _mantissa.2 = UInt16(truncatingIfNeeded: compactValue >> 32)
-        _mantissa.3 = UInt16(truncatingIfNeeded: compactValue >> 48)
+        if value == 0 { return }
+        _significand = UInt128(truncatingIfNeeded: value)
+        _exponent = 0
+        _isCompact = 0
+        compact()
     }
 
     /// Creates and initializes a decimal with the provided integer value.
@@ -183,80 +169,73 @@ extension Decimal /* : FloatingPoint */ {
         self.init(Int64(value))
     }
 
-    /// Creates and initializes a decimal with the provided floating point value.
+    /// Creates and initializes a decimal with the provided floating-point value.
     public init(_ value: Double) {
-        precondition(!value.isInfinite, "Decimal does not yet fully adopt FloatingPoint")
-        if value.isNaN {
-            self = Decimal.nan
-        } else if value == 0.0 {
-            self = Decimal()
-        } else {
-            self = Decimal()
-            let negative = value < 0
-            var val = negative ? -1 * value : value
-            var exponent: Int8 = 0
-
-            // Try to get val as close to UInt64.max whilst adjusting the exponent
-            // to reduce the number of digits after the decimal point.
-            while val < Double(UInt64.max - 1) {
-                guard exponent > Int8.min else {
-                    self = .nan
-                    return
-                }
-                val *= 10.0
-                exponent -= 1
-            }
-            while Double(UInt64.max) <= val {
-                guard exponent < Int8.max else {
-                    self = .nan
-                    return
-                }
-                val /= 10.0
-                exponent += 1
-            }
-            var mantissa: UInt64
-            let maxMantissa = Double(UInt64.max).nextDown
-            if val > maxMantissa {
-                // UInt64(Double(UInt64.max)) gives an overflow error,
-                // this is the largest mantissa that can be set.
-                mantissa = UInt64(maxMantissa)
-            } else {
-                mantissa = UInt64(val)
-            }
-
-            var i: UInt32 = 0
-            // This is a bit ugly but it is the closest approximation of the C
-            // initializer that can be expressed here.
-            while mantissa != 0 && i < 8 /* NSDecimalMaxSize */ {
-                switch i {
-                case 0:
-                    _mantissa.0 = UInt16(truncatingIfNeeded: mantissa)
-                case 1:
-                    _mantissa.1 = UInt16(truncatingIfNeeded: mantissa)
-                case 2:
-                    _mantissa.2 = UInt16(truncatingIfNeeded: mantissa)
-                case 3:
-                    _mantissa.3 = UInt16(truncatingIfNeeded: mantissa)
-                case 4:
-                    _mantissa.4 = UInt16(truncatingIfNeeded: mantissa)
-                case 5:
-                    _mantissa.5 = UInt16(truncatingIfNeeded: mantissa)
-                case 6:
-                    _mantissa.6 = UInt16(truncatingIfNeeded: mantissa)
-                case 7:
-                    _mantissa.7 = UInt16(truncatingIfNeeded: mantissa)
-                default:
-                    fatalError("initialization overflow")
-                }
-                mantissa = mantissa >> 16
-                i += 1
-            }
-            _length = i
-            _isNegative = negative ? 1 : 0
-            _isCompact = 0
-            _exponent = Int32(exponent)
-            self.compact()
+        // Note: infinity is represented (as in overflow during arithmetic
+        // operations) by NaN, and values that are too small lose precision or
+        // flush to zero (as in `init(sign:exponent:significand:)` below).
+        let exponent = value.exponent
+        // `Decimal.greatestFiniteMagnitude` (gfm) is `(2**128 - 1) * 10**127`,
+        // and ⌊ log2(gfm) ⌋ = 549.
+        guard exponent <= 549 else {
+            // NaN, infinity, or too large.
+            self = .nan
+            return
         }
+        // 5e-129 can round up to 1e-128, and ⌊ log2(5e-129) ⌋ = -427.
+        guard exponent >= -427 else {
+            // Zero or too small.
+            self = Decimal()
+            return
+        }
+        // All subnormal `Double` values have exponent less than -427.
+        assert(!value.isSubnormal)
+        let (d, k) = _cox_shortest(normal: value.magnitude)
+        guard k <= 127 else {
+            let shift = k &- 127
+            guard shift <= 38 else {
+                self = .nan
+                return
+            }
+            let (d_, overflow) =
+                UInt128(truncatingIfNeeded: d)
+                .multipliedReportingOverflow(by: _decimal_pow10[shift])
+            guard !overflow else {
+                self = .nan
+                return
+            }
+            self = Decimal()
+            self._significand = d_
+            self._exponent = 127
+            self._isNegative = (value < 0) ? 1 : 0
+            self._isCompact = 1
+            return
+        }
+        guard k >= -128 else {
+            self = Decimal()
+            // Re-round at fixed decimal scale -- cf. Cox's `FixedWidth`.
+            let (m, e) = _cox_unpack(normal: value.magnitude)
+            let u = _cox_uscale(
+                m,
+                _cox_table[476], // `128 &+ 348`
+                -(e &+ 428)  // `-(e &+ lp &+ 3)`, where `lp = (128 &* 108853) &>> 15`
+            )
+            let d_ = (u &+ 1 &+ ((u &>> 2) & 1)) &>> 2 // Round (ties to even), shifting out the extra bits.
+            if d_ == 0 {
+                return
+            }
+            self._significand = UInt128(truncatingIfNeeded: d_)
+            self._exponent = -128
+            self._isNegative = (value < 0) ? 1 : 0
+            self._isCompact = 0
+            self.compact()
+            return
+        }
+        self = Decimal()
+        self._significand = UInt128(truncatingIfNeeded: d)
+        self._exponent = Int32(truncatingIfNeeded: k)
+        self._isNegative = (value < 0) ? 1 : 0
+        self._isCompact = 1
     }
 
     /// Creates a decimal initialized with the given sign, exponent, and significand.
