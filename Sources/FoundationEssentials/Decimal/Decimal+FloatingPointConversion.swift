@@ -24,7 +24,7 @@
 //
 // Cox's proof of correctness requires error ε < 1 ulp, so this table can't be
 // replaced by a product of coarse and fine values.
-internal let _cox_table: [_ of (high: UInt64, low: UInt64)] = [
+private let _table: [_ of (high: UInt64, low: UInt64)] = [
     (0xfa8fd5a0081c0289, 0xe8cd3796329f1bac), // 1e-348 * 2**1284
     (0x9c99e58405118196, 0xf18042bddfa3714b), // 1e-347 * 2**1280
     (0xc3c05ee50655e1fb, 0xade0536d578c4d9e), // 1e-346 * 2**1277
@@ -794,7 +794,7 @@ private func _trimZeros(_ x: UInt64, _ p: Int) -> (UInt64, Int) {
 }
 
 @inline(__always)
-internal func _cox_unpack(normal value: Double) -> (m: UInt64, e: Int) {
+private func _cox_unpack(normal value: Double) -> (m: UInt64, e: Int) {
     assert(value.isNormal)
     return (
         m: (value.significandBitPattern | (1 &<< 52)) &<< 11,
@@ -802,7 +802,7 @@ internal func _cox_unpack(normal value: Double) -> (m: UInt64, e: Int) {
 }
 
 @inline(__always)
-internal func _cox_unpack(_ value: Double) -> (m: UInt64, e: Int) {
+private func _cox_unpack(_ value: Double) -> (m: UInt64, e: Int) {
     assert(value.isFinite && !value.isZero)
     let e_ = value.exponentBitPattern
     let m_ = value.significandBitPattern &<< 11
@@ -822,7 +822,7 @@ internal func _cox_unpack(_ value: Double) -> (m: UInt64, e: Int) {
 //
 // See Cox's discussion for details and proof of correctness.
 @inline(__always)
-internal func _cox_uscale(
+private func _cox_uscale(
     _ x: UInt64,
     _ pm: (high: UInt64, low: UInt64),
     _ s: Int
@@ -841,7 +841,7 @@ internal func _cox_uscale(
 
 // Returns the shortest 'formatting' (i.e., decimal representation) of `value`
 // that will round-trip back to the original value.
-internal func _cox_shortest(normal value: Double) -> (d: UInt64, k: Int) {
+private func _cox_shortest(normal value: Double) -> (d: UInt64, k: Int) {
     assert(value.isNormal)
     let minE = -1085
     let (m, e) = _cox_unpack(normal: value)
@@ -858,7 +858,7 @@ internal func _cox_shortest(normal value: Double) -> (d: UInt64, k: Int) {
     let hi = m &+ 1024 // m + (ulp / 2)
     let odd = (m &>> 11) & 1
     
-    let pm = _cox_table[p &+ 348]
+    let pm = _table[p &+ 348]
     let lp = (p &* 108853) &>> 15
     let s = -(e &+ lp &+ 3) // Reserve two extra bits for unrounded representation.
     let dlo = (_cox_uscale(lo, pm, s) &+ odd &+ 3) &>> 2 // Nudge, then take ceiling, shifting out the extra bits.
@@ -876,4 +876,75 @@ internal func _cox_shortest(normal value: Double) -> (d: UInt64, k: Int) {
         d = (u &+ 1 &+ ((u &>> 2) & 1)) &>> 2 // Round (ties to even), shifting out the extra bits.
     }
     return (d, -p)
+}
+
+extension Decimal {
+    /// Creates and initializes a decimal with the provided floating-point value.
+    public init(_ value: Double) {
+        // Note: infinity is represented (as in overflow during arithmetic
+        // operations) by NaN, and values that are too small lose precision or
+        // flush to zero (as in `init(sign:exponent:significand:)` below).
+        let exponent = value.exponent
+        // `Decimal.greatestFiniteMagnitude` (gfm) is `(2**128 - 1) * 10**127`,
+        // and ⌊ log2(gfm) ⌋ = 549.
+        guard exponent <= 549 else {
+            // NaN, infinity, or too large.
+            self = .nan
+            return
+        }
+        // 5e-129 can round up to 1e-128, and ⌊ log2(5e-129) ⌋ = -427.
+        guard exponent >= -427 else {
+            // Zero or too small.
+            self = Decimal()
+            return
+        }
+        // All subnormal `Double` values have exponent less than -427.
+        assert(!value.isSubnormal)
+        let (d, k) = _cox_shortest(normal: value.magnitude)
+        guard k <= 127 else {
+            let shift = k &- 127
+            guard shift <= 38 else {
+                self = .nan
+                return
+            }
+            let (d_, overflow) =
+                UInt128(truncatingIfNeeded: d)
+                .multipliedReportingOverflow(by: _uint128_pow10[shift])
+            guard !overflow else {
+                self = .nan
+                return
+            }
+            self = Decimal()
+            self._significand = d_
+            self._exponent = 127
+            self._isNegative = (value < 0) ? 1 : 0
+            self._isCompact = 1
+            return
+        }
+        guard k >= -128 else {
+            self = Decimal()
+            // Re-round at fixed decimal scale -- cf. Cox's `FixedWidth`.
+            let (m, e) = _cox_unpack(normal: value.magnitude)
+            let u = _cox_uscale(
+                m,
+                _table[476], // `128 &+ 348`
+                -(e &+ 428)  // `-(e &+ lp &+ 3)`, where `lp = (128 &* 108853) &>> 15`
+            )
+            let d_ = (u &+ 1 &+ ((u &>> 2) & 1)) &>> 2 // Round (ties to even), shifting out the extra bits.
+            if d_ == 0 {
+                return
+            }
+            self._significand = UInt128(truncatingIfNeeded: d_)
+            self._exponent = -128
+            self._isNegative = (value < 0) ? 1 : 0
+            self._isCompact = 0
+            self.compact()
+            return
+        }
+        self = Decimal()
+        self._significand = UInt128(truncatingIfNeeded: d)
+        self._exponent = Int32(truncatingIfNeeded: k)
+        self._isNegative = (value < 0) ? 1 : 0
+        self._isCompact = 1
+    }
 }

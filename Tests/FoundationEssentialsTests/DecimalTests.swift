@@ -1005,6 +1005,7 @@ private struct DecimalTests {
         ]
 
         for (d, s) in testDoubles {
+            #expect(Decimal(d) == Decimal(string: d.description))
             #expect(Decimal(d) == Decimal(string: s))
             #expect(try Decimal(d).description == #require(Decimal(string: s)).description)
         }
