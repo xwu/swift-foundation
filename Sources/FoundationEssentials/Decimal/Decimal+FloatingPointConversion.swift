@@ -11,7 +11,8 @@
 //===----------------------------------------------------------------------===//
 //
 // Swift-native implementation of Cox's fast unrounded scaling algorithm for
-// shortest-width printing (2026), described at https://research.swtch.com/fp
+// floating-point parsing and shortest-width printing (2026), described at:
+// https://research.swtch.com/fp
 //
 // In lieu of an 'unrounded' type with two trailing bits for correct rounding,
 // we perform the relevant bit shifts inline.
@@ -723,6 +724,37 @@ private let _table: [_ of (high: UInt64, low: UInt64)] = [
     (0xd13eb46469447568, 0xb48e6a0d2d2e5604), // 1e347 * 2**-1025
 ]
 
+private let _uint64_pow5: [28 of UInt64] = [
+    1,
+    5,
+    25,
+    125,
+    625,
+    3125,
+    15625,
+    78125,
+    390625,
+    1953125,
+    9765625,
+    48828125,
+    244140625,
+    1220703125,
+    6103515625,
+    30517578125,
+    152587890625,
+    762939453125,
+    3814697265625,
+    19073486328125,
+    95367431640625,
+    476837158203125,
+    2384185791015625,
+    11920928955078125,
+    59604644775390625,
+    298023223876953125,
+    1490116119384765625,
+    7450580596923828125,
+]
+
 private extension UInt64 {
     // Exact division by a constant (cf. Granlund and Montgomery, 1994 §9).
     // Multiply by the inverse of the divisor's odd part (mod `2**64`), then
@@ -794,26 +826,17 @@ private func _trimZeros(_ x: UInt64, _ p: Int) -> (UInt64, Int) {
 }
 
 @inline(__always)
+private func _cox_pack(normal m: UInt64, _ e: Int) -> Double {
+    assert(m & (1 &<< 52) != 0)
+    return Double(bitPattern: (m ^ (1 &<< 52)) | (UInt64(e &+ 1075) &<< 52))
+}
+
+@inline(__always)
 private func _cox_unpack(normal value: Double) -> (m: UInt64, e: Int) {
     assert(value.isNormal)
     return (
         m: (value.significandBitPattern | (1 &<< 52)) &<< 11,
         e: Int(bitPattern: value.exponentBitPattern) &- 1086)
-}
-
-@inline(__always)
-private func _cox_unpack(_ value: Double) -> (m: UInt64, e: Int) {
-    assert(value.isFinite && !value.isZero)
-    let e_ = value.exponentBitPattern
-    let m_ = value.significandBitPattern &<< 11
-    if e_ != 0 {
-        return (
-            m: m_ | 9223372036854775808 /* 1 << 63 */,
-            e: Int(bitPattern: e_) &- 1086)
-    }
-    // Subnormal.
-    let s = m_.leadingZeroBitCount
-    return (m: m_ &<< s, e: -1085 &- s)
 }
 
 // Returns the 'unrounded' result `x * 2**e * 10**p` (that is, with two trailing
@@ -839,8 +862,156 @@ private func _cox_uscale(
     return (hi &>> s) | sticky
 }
 
-// Returns the shortest 'formatting' (i.e., decimal representation) of `value`
-// that will round-trip back to the original value.
+// Returns the `Double` value nearest to the decimal magnitude `d * (10**p)`
+// represented by the given arguments, with `d` at most `10_000_000_000_000_000_000`.
+private func _cox_parse(normal d: UInt64, _ p: Int) -> Double {
+    assert(d <= 10_000_000_000_000_000_000)
+    let clz = d.leadingZeroBitCount
+    let lp = (p &* 108853) &>> 15
+    var e = clz &- 11 &- lp // `min(1074, clz &- 11 &- lp)`...
+    // ...but `min` is redundant when we limit possible values for `p`.
+    assert(e <= 1074)
+    var u = _cox_uscale(
+        d &<< clz,
+        _table[p &+ 348],
+        8 // `-(e &- clz &+ lp &+ 3)` is a constant when `min` is redundant.
+    )
+    // Handle the case where the significand would otherwise be 1<<53:
+    let s = u >= ((1 &<< 55) &- 2) ? 1 : 0
+    u = (u &>> s) | (u & 1)
+    e &-= s
+    // Round significand (ties to even), shifting out the extra bits.
+    return _cox_pack(normal: (u &+ 1 &+ ((u &>> 2) & 1)) &>> 2, -e)
+}
+
+// A minimal, 512-bit unsigned integer type.
+private struct _Wide {
+    var storage: [4 of UInt128] = .init(repeating: 0)
+
+    init(_ value: UInt128) {
+        storage[0] = value
+    }
+
+    private mutating func _multiply(by multiplicand: UInt64) {
+        let multiplicand = UInt128(truncatingIfNeeded: multiplicand)
+        var carry: UInt128 = 0
+        for i in 0..<4 {
+            let (high, low) = storage[i].multipliedFullWidth(by: multiplicand)
+            let (sum, overflow) = low.addingReportingOverflow(carry)
+            storage[i] = sum
+            carry = high &+ (overflow ? 1 : 0)
+        }
+        assert(carry == 0)
+    }
+
+    mutating func multiply(byPowerOfFive power: Int) {
+        var power = power
+        while power >= 27 {
+            _multiply(by: _uint64_pow5[27])
+            power &-= 27
+        }
+        if power > 0 {
+            _multiply(by: _uint64_pow5[power])
+        }
+    }
+
+    mutating func shiftLeft(by bits: Int) {
+        let words = bits &>> 7
+        let bits_ = bits & 127
+        var result = [4 of UInt128](repeating: 0)
+        for i in 0..<4 {
+            let j = i &- words
+            var v: UInt128 = 0
+            if j >= 0 {
+                v = storage[j] &<< bits_
+                if j != 0 {
+                    v |= storage[j &- 1] >> (128 - bits_) // *Not* masking shift.
+                }
+            }
+            result[i] = v
+        }
+        storage = result
+    }
+
+    static func compare(
+        _ lhs: borrowing Self,
+        _ rhs: borrowing Self
+    ) -> ComparisonResult {
+        for i in 0..<4 {
+            let j = 3 &- i
+            if lhs.storage[j] != rhs.storage[j] {
+                return lhs.storage[j] < rhs.storage[j]
+                    ? .orderedAscending
+                    : .orderedDescending
+            }
+        }
+        return .orderedSame
+    }
+}
+
+// Returns the `Double` value nearest to the decimal magnitude `d * (10**p)`
+// represented by the given arguments, with `d` at most `UInt128.max`.
+private func _parseWide(normal d: UInt128, _ p: Int) -> Double {
+    // Truncate `d` to 19 digits and call `_cox_parse` on both the truncated
+    // value and its successor to obtain bracketing `Double` values that are
+    // either equal or adjacent.
+    //
+    // In the latter case, pick the nearest to `d` (ties to even) by exact
+    // comparison of `d` to the midpoint of the bracketing `Double` values using
+    // full-precision integer arithmetic.
+    var shift = (((127 &- (d|1).leadingZeroBitCount) &* 1233) &>> 12) &- 18 // `estimatedDigitCount - 19`
+    assert(shift >= 0)
+    var divisor = _uint128_pow10[shift]
+    var (q, r) = d.quotientAndRemainder(dividingBy: divisor)
+    if q >= 10_000_000_000_000_000_000 { // Note `>=`, because `q + 1` can't exceed 1e19.
+        let r_: UInt128
+        (q, r_) = q._quotientAndRemainderDividingBy10()
+        r &+= r_ &* divisor
+        divisor &*= 10
+        shift &+= 1
+    }
+    let d_ = UInt64(truncatingIfNeeded: q)
+    let p_ = p &+ shift
+    let x = _cox_parse(normal: d_, p_)
+    if r == 0 {
+        return x
+    }
+    let y = _cox_parse(normal: d_ &+ 1, p_)
+    if x == y {
+        return x
+    }
+
+    // Work out the midpoint between `abs(x)` and `abs(x).nextUp`.
+    // First unpack `x` (without top-aligning the significand as in `_cox_unpack`).
+    let xm = x.significandBitPattern | (1 &<< 52) // Recall that `x` is normal.
+    let xe = Int(bitPattern: x.exponentBitPattern) &- 1075
+    // The midpoint is always 0.5 ulp greater
+    // (even at binade edges since we're only looking at the next *up*),
+    // so shift and offset the significand and lower the exponent.
+    let mm = (UInt128(truncatingIfNeeded: xm) &<< 1) | 1 // `2 * xm + 1`
+    let me = xe &- 1
+    // Compare `d * (10**p) = d * (2**p) * (5**p)`, the value to be parsed,
+    // to the midpoint `mm * (2**me)` with full precision.
+    var a = _Wide(d), b = _Wide(mm)
+    if p > 0 {
+        a.multiply(byPowerOfFive: p)
+    } else if p < 0 {
+        b.multiply(byPowerOfFive: -p)
+    }
+    if p > me {
+        a.shiftLeft(by: p &- me)
+    } else if p < me {
+        b.shiftLeft(by: me &- p)
+    }
+    return switch _Wide.compare(a, b) {
+    case .orderedAscending: x
+    case .orderedSame: (xm & 1 == 0) ? x : y // Ties to even.
+    case .orderedDescending: y
+    }
+}
+
+// Returns the shortest 'formatting' (i.e., decimal representation) of the
+// value's magnitude that will round-trip back to the original.
 private func _cox_shortest(normal value: Double) -> (d: UInt64, k: Int) {
     assert(value.isNormal)
     let minE = -1085
@@ -946,5 +1117,24 @@ extension Decimal {
         self._exponent = Int32(truncatingIfNeeded: k)
         self._isNegative = (value < 0) ? 1 : 0
         self._isCompact = 1
+    }
+
+    internal var __doubleValue: Double {
+        if self._length == 0 {
+            return _isNegative == 1 ? .nan : .zero
+        }
+        let significand = _significand
+        let p = Int(truncatingIfNeeded: _exponent)
+        if significand <= 10_000_000_000_000_000_000 {
+            if significand == 0 {
+                // This branch is not reachable except with invalid values.
+                return _isNegative == 1 ? .nan : .zero
+            }
+            let abs =
+                _cox_parse(normal: UInt64(truncatingIfNeeded: significand), p)
+            return _isNegative == 1 ? -abs : abs
+        }
+        let abs = _parseWide(normal: significand, p)
+        return _isNegative == 1 ? -abs : abs
     }
 }

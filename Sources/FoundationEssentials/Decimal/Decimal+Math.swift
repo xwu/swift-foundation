@@ -66,16 +66,16 @@ internal let _uint128_pow10: [39 of UInt128] = [
     100_000_000_000_000_000_000_000_000_000_000_000_000,    // 38
 ]
 
-private extension UInt128 {
+extension UInt128 {
     @inline(__always)
-    static func _compare(_ lhs: Self, _ rhs: Self) -> ComparisonResult {
+    internal static func _compare(_ lhs: Self, _ rhs: Self) -> ComparisonResult {
         if lhs == rhs { return .orderedSame }
         if lhs < rhs { return .orderedAscending }
         return .orderedDescending
     }
     
     @inline(__always)
-    func _multipliedFullWidth(by1e exponent: Int) -> (high: Self, low: Self) {
+    internal func _multipliedFullWidth(by1e exponent: Int) -> (high: Self, low: Self) {
         if exponent <= 19 && self <= 18446744073709551615 /* UInt64.max */ {
             let (hi, lo) = UInt64(truncatingIfNeeded: self)
                 .multipliedFullWidth(by: UInt64(truncatingIfNeeded: _uint128_pow10[exponent]))
@@ -86,7 +86,7 @@ private extension UInt128 {
 
     // Division by constant integer using multiplication and shift (cf. Granlund and Montgomery, 1991).
     @inline(__always)
-    func _quotientAndRemainderDividingBy10() -> (quotient: Self, remainder: Self) {
+    internal func _quotientAndRemainderDividingBy10() -> (quotient: Self, remainder: Self) {
         let m = 0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCD as UInt128
         let q = self.multipliedFullWidth(by: m).high &>> 3
         let r = self &- q &* 10
@@ -94,7 +94,7 @@ private extension UInt128 {
     }
 
     @inline(__always)
-    func _quotientAndRemainderDividingBy10000() -> (quotient: Self, remainder: Self) {
+    internal func _quotientAndRemainderDividingBy10000() -> (quotient: Self, remainder: Self) {
         let m = 0xD1B71758E219652BD3C36113404EA4A9 as UInt128
         let q = self.multipliedFullWidth(by: m).high &>> 13
         let r = self &- q &* 10000
@@ -104,7 +104,7 @@ private extension UInt128 {
     // Full-width division of `(high * 2**128 + low)` by a constant divisor,
     // using a single step of schoolbook short division in base `2**128` (cf. Knuth exercise 4.3.1-16).
     @inline(__always)
-    static func _10DividingFullWidth(
+    internal static func _10DividingFullWidth(
         _ dividend: (high: Self, low: Self)
     ) -> (quotient: Self, remainder: Self) {
         assert(dividend.high < 10) // ...or else the result would overflow `UInt128`.
@@ -131,7 +131,7 @@ private extension UInt128 {
     }
 
     @inline(__always)
-    static func _10000DividingFullWidth(
+    internal static func _10000DividingFullWidth(
         _ dividend: (high: Self, low: Self)
     ) -> (quotient: Self, remainder: Self) {
         assert(dividend.high < 10000)
@@ -145,7 +145,7 @@ private extension UInt128 {
     // Exact division by a constant (cf. Granlund and Montgomery, 1994 §9).
     // See discussion on analogous `UInt64` extensions for more.
     @inline(__always)
-    func _quotientIfExactDividingBy10() -> Self? {
+    internal func _quotientIfExactDividingBy10() -> Self? {
         let m = 0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCD as UInt128 // Inverse of 5 (mod 2**128).
         let p = self &* m
         let q = p &>> 1 | p &<< 127
@@ -154,7 +154,7 @@ private extension UInt128 {
     }
 
     @inline(__always)
-    func _quotientIfExactDividingBy100() -> Self? {
+    internal func _quotientIfExactDividingBy100() -> Self? {
         let m = 0x28F5C28F5C28F5C28F5C28F5C28F5C29 as UInt128 // Inverse of 5**2 (mod 2**128).
         let p = self &* m
         let q = p &>> 2 | p &<< 126
@@ -163,7 +163,7 @@ private extension UInt128 {
     }
 
     @inline(__always)
-    func _quotientIfExactDividingBy10000() -> Self? {
+    internal func _quotientIfExactDividingBy10000() -> Self? {
         let m = 0x495182A9930BE0DED288CE703AFB7E91 as UInt128 // Inverse of 5**4 (mod 2**128).
         let p = self &* m
         let q = p &>> 4 | p &<< 124
@@ -172,7 +172,7 @@ private extension UInt128 {
     }
 
     @inline(__always)
-    func _quotientIfExactDividingBy1e8() -> Self? {
+    internal func _quotientIfExactDividingBy1e8() -> Self? {
         let m = 0xF36B7213EE9F5A78C767074B22E90E21 as UInt128 // Inverse of 5**8 (mod 2**128).
         let p = self &* m
         let q = p &>> 8 | p &<< 120
@@ -181,7 +181,7 @@ private extension UInt128 {
     }
 
     @inline(__always)
-    func _quotientIfExactDividingBy1e16() -> Self? {
+    internal func _quotientIfExactDividingBy1e16() -> Self? {
         let m = 0xF60B3275305C1066E4A4D1417CD9A041 as UInt128 // Inverse of 5**16 (mod 2**128).
         let p = self &* m
         let q = p &>> 16 | p &<< 112
@@ -190,7 +190,7 @@ private extension UInt128 {
     }
 
     @inline(__always)
-    func _quotientIfExactDividingBy1e32() -> Self? {
+    internal func _quotientIfExactDividingBy1e32() -> Self? {
         let m = 0x62B42691AD836EB116590F420A835081 as UInt128 // Inverse of 5**32 (mod 2**128).
         let p = self &* m
         let q = p &>> 32 | p &<< 96
@@ -805,25 +805,7 @@ extension Decimal {
 // MARK: - Numeric Values
 extension Decimal {
     internal var doubleValue: Double {
-        if _length == 0 {
-            return _isNegative == 1 ? Double.nan : 0
-        }
-
-        var d = 0.0
-        for idx in (0..<min(_length, 8)).reversed() {
-            d = d * 65536 + Double(self[idx])
-        }
-
-        if _exponent < 0 {
-            for _ in _exponent..<0 {
-                d /= 10.0
-            }
-        } else {
-            for _ in 0..<_exponent {
-                d *= 10.0
-            }
-        }
-        return _isNegative != 0 ? -d : d
+        __doubleValue
     }
 
     private var _unsignedInt64Value: UInt64 {
@@ -891,7 +873,7 @@ extension Decimal {
     public var _uint64Value: UInt64 { uint64Value }
     
     @_spi(SwiftCorelibsFoundation)
-    public var _doubleValue: Double { doubleValue }
+    public var _doubleValue: Double { __doubleValue }
     #endif
 }
 
