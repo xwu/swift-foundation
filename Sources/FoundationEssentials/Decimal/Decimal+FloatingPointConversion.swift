@@ -959,13 +959,26 @@ private func _parseWide(normal d: UInt128, _ p: Int) -> Double {
     // In the latter case, pick the nearest to `d` (ties to even) by exact
     // comparison of `d` to the midpoint of the bracketing `Double` values using
     // full-precision integer arithmetic.
-    var shift = (((127 &- (d|1).leadingZeroBitCount) &* 1233) &>> 12) &- 18 // `estimatedDigitCount - 19`
+
+    // Use a deliberate underestimate of the decimal digit count of `d`,
+    // using 19/64 as a close (but not too close!) approximation of 1/log2(10).
+    //
+    // See:
+    // - Hacker's Delight, ch. 11
+    // - https://lemire.me/blog/2021/05/28/computing-the-number-of-digits-of-an-integer-quickly/
+    //
+    // A rational approximation `a / b` is too close if `⌊ 127 * a / b ⌋ == 38`
+    // because attempts to compute `10 ** (38 + 1)` result in overflow.
+    // But an approximation is not close enough if (as is the case with 9/32)
+    // it'd result in underestimation of the true digit count by more than 1.
+    let estimate = (((127 &- (d|1).leadingZeroBitCount) &* 19) &>> 6) &+ 1
+    var shift = estimate &- 19
     assert(shift >= 0)
     var divisor = _uint128_pow10[shift]
     var (q, r) = d.quotientAndRemainder(dividingBy: divisor)
     if q >= 10_000_000_000_000_000_000 { // Note `>=`, because `q + 1` can't exceed 1e19.
         let r_: UInt128
-        (q, r_) = q._quotientAndRemainderDividingBy10()
+        (q, r_) = q._quotientAndRemainder(dividingBy1e: 1)
         r &+= r_ &* divisor
         divisor &*= 10
         shift &+= 1
