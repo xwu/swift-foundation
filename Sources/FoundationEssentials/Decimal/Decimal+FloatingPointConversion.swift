@@ -889,16 +889,17 @@ private struct _Wide {
     var storage: [4 of UInt128] = .init(repeating: 0)
 
     init(_ value: UInt128) {
-        storage[0] = value
+        storage[unchecked: 0] = value
     }
 
     private mutating func _multiply(by multiplicand: UInt64) {
         let multiplicand = UInt128(truncatingIfNeeded: multiplicand)
         var carry: UInt128 = 0
         for i in 0..<4 {
-            let (high, low) = storage[i].multipliedFullWidth(by: multiplicand)
+            let (high, low) =
+                storage[unchecked: i].multipliedFullWidth(by: multiplicand)
             let (sum, overflow) = low.addingReportingOverflow(carry)
-            storage[i] = sum
+            storage[unchecked: i] = sum
             carry = high &+ (overflow ? 1 : 0)
         }
         assert(carry == 0)
@@ -907,28 +908,30 @@ private struct _Wide {
     mutating func multiply(byPowerOfFive power: Int) {
         var power = power
         while power >= 27 {
-            _multiply(by: _uint64_pow5[27])
+            _multiply(by: 7450580596923828125) // 5**27
             power &-= 27
         }
         if power > 0 {
-            _multiply(by: _uint64_pow5[power])
+            _multiply(by: _uint64_pow5[unchecked: power])
         }
     }
 
+    // Note that this is implemented as a *masking* shift.
+    // (It doesn't matter for our use case.)
     mutating func shiftLeft(by bits: Int) {
-        let words = bits &>> 7
+        let words = (bits & 511) &>> 7
         let bits_ = bits & 127
         var result = [4 of UInt128](repeating: 0)
         for i in 0..<4 {
             let j = i &- words
             var v: UInt128 = 0
             if j >= 0 {
-                v = storage[j] &<< bits_
+                v = storage[unchecked: j] &<< bits_
                 if j != 0 {
-                    v |= storage[j &- 1] >> (128 - bits_) // *Not* masking shift.
+                    v |= storage[unchecked: j &- 1] >> (128 - bits_) // *Not* masking shift.
                 }
             }
-            result[i] = v
+            result[unchecked: i] = v
         }
         storage = result
     }
@@ -939,8 +942,8 @@ private struct _Wide {
     ) -> ComparisonResult {
         for i in 0..<4 {
             let j = 3 &- i
-            if lhs.storage[j] != rhs.storage[j] {
-                return lhs.storage[j] < rhs.storage[j]
+            if lhs.storage[unchecked: j] != rhs.storage[unchecked: j] {
+                return lhs.storage[unchecked: j] < rhs.storage[unchecked: j]
                     ? .orderedAscending
                     : .orderedDescending
             }
