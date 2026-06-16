@@ -866,11 +866,88 @@ extension Decimal {
 }
 
 // MARK: - Numeric Values
-extension Decimal {
-    internal var doubleValue: Double {
-        __doubleValue
+private extension Decimal {
+    func _truncatingMagnitude() -> (result: Decimal, inexact: Bool) {
+        if self._length == 0 {
+            return (self, false)
+        }
+        let e = self._exponent
+        var result = self
+        if e >= 0 {
+            result._isNegative = 0
+            return (result, false)
+        }
+        if e <= -39 {
+            return (.zero, self._significand != 0)
+        }
+        let r: UInt128
+        (result._significand, r) =
+            self._significand._quotientAndRemainder(dividingBy1e: -Int(e))
+        result._exponent = 0
+        result._isNegative = 0
+        result._isCompact = 0
+        // Don't compact.
+        return (result, r != 0)
+    }
+}
+
+extension FixedWidthInteger {
+    // Dual of `Decimal.init?<T: BinaryInteger>(exactly:)`.
+    internal static func _convert(from value: Decimal) -> (value: Self?, inexact: Bool) {
+        if value.isNaN {
+            return (nil, false)
+        }
+        let (truncated, inexact) = value._truncatingMagnitude()
+        let isNegative = (value._isNegative != 0)
+        guard Self.isSigned || !isNegative else {
+            // A negative value isn't representable as an unsigned integer,
+            // *unless* the integer part is zero.
+            return (truncated.isZero ? 0 : nil, inexact)
+        }
+        guard var magnitude = Magnitude(exactly: truncated._significand) else {
+            return (nil, inexact)
+        }
+        var scale = Int(truncated._exponent)
+        while scale > 0 {
+            let x = Swift.min(scale, 38)
+            guard let multiplier = Magnitude(exactly: _uint128_pow10[x]) else {
+                return (nil, inexact)
+            }
+            guard case (let product, false) = magnitude.multipliedReportingOverflow(by: multiplier) else {
+                return (nil, inexact)
+            }
+            magnitude = product
+            scale &-= x
+        }
+        if let magnitude_ = Self(exactly: magnitude) {
+            return (isNegative ? 0 - magnitude_ : magnitude_, inexact)
+        } else if isNegative && magnitude == Self.min.magnitude {
+            return (Self.min, inexact)
+        }
+        return (nil, inexact)
     }
 
+    internal init(_ source: Decimal) {
+        // Truncating conversion, trapping if out of range or NaN.
+        guard let value = Self._convert(from: source).value else {
+            preconditionFailure("Decimal value cannot be converted to \(Self.self): out of range or NaN")
+        }
+        self = value
+    }
+
+    internal init?(exactly source: Decimal) {
+        // Exact conversion, nil if inexact, out of range, or NaN.
+        guard case (let value?, false) = Self._convert(from: source) else {
+            return nil
+        }
+        self = value
+    }
+}
+
+// Note: Methods for conversion to integer types in the following extension are
+// preserved for their quirks--they exhibit unspecified behavior for some inputs
+// and aren't performant.
+extension Decimal {
     private var _unsignedInt64Value: UInt64 {
         // Quick check if number if has too many zeros before decimal point or too many trailing zeros after decimal point.
         // Log10 (2^64) ~ 19, log10 (2^128) ~ 38
@@ -926,7 +1003,11 @@ extension Decimal {
         }
         return value
     }
-    
+
+    internal var doubleValue: Double {
+        __doubleValue
+    }
+
     #if FOUNDATION_FRAMEWORK
     #else
     @_spi(SwiftCorelibsFoundation)
