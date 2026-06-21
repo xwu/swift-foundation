@@ -1248,6 +1248,12 @@ private struct DecimalTests {
             #expect(Decimal(d).doubleValue == d)
             #expect(Decimal(d).doubleValue == Double(s))
         }
+
+        let midpoint: Decimal = Decimal(string: "10746007285463371481088")!
+        let lower: Double = 0x1.23456789abcdfp+73
+        // As the name suggests, `midpoint` is exactly the midpoint between `lower` and `lower.nextUp`.
+        // Thus, `midpoint` should be converted to `lower.nextUp` (by *either* ties-away or ties-to-even rounding).
+        #expect(midpoint.doubleValue == lower.nextUp)
     }
 
     @Test func integerConversion() async throws {
