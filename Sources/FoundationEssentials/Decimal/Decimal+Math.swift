@@ -1038,26 +1038,9 @@ extension Decimal {
         return value
     }
 
+    @inline(__always)
     internal var doubleValue: Double {
-        if _length == 0 {
-            return _isNegative == 1 ? Double.nan : 0
-        }
-
-        var d = 0.0
-        for idx in (0..<min(_length, 8)).reversed() {
-            d = d * 65536 + Double(self[idx])
-        }
-
-        if _exponent < 0 {
-            for _ in _exponent..<0 {
-                d /= 10.0
-            }
-        } else {
-            for _ in 0..<_exponent {
-                d *= 10.0
-            }
-        }
-        return _isNegative != 0 ? -d : d
+        __doubleValue
     }
 
     #if FOUNDATION_FRAMEWORK
@@ -1069,7 +1052,7 @@ extension Decimal {
     public var _uint64Value: UInt64 { uint64Value }
     
     @_spi(SwiftCorelibsFoundation)
-    public var _doubleValue: Double { doubleValue }
+    public var _doubleValue: Double { __doubleValue }
     #endif
 }
 
