@@ -896,6 +896,96 @@ extension Decimal {
     }
 }
 
+#if FOUNDATION_FRAMEWORK
+@available(anyAppleOS 10000, *) // Move availability to public APIs; this is just a reminder.
+#endif
+extension Decimal {
+    internal func _remainder(
+        truncating: Bool,
+        dividingBy divisor: Decimal
+    ) throws(_CalculationError) -> Decimal {
+        guard !self.isNaN && !divisor.isNaN else {
+            throw .overflow
+        }
+        let dm = divisor._significand
+        guard divisor._length > 0 && dm != 0 else {
+            throw .divideByZero
+        }
+        let sm = self._significand
+        guard self._length > 0 && sm != 0 else {
+            return .zero
+        }
+
+        var isNegative = (self._isNegative != 0)
+        var exponent: Int32
+        var shift = Int(self._exponent - divisor._exponent)
+        var residue: UInt128
+
+        if shift < 0 {
+            exponent = self._exponent
+            if -shift > 38 {
+                // Both truncated and nearest quotient are zero.
+                residue = sm
+            } else {
+                let (hi, lo) = dm._multipliedFullWidth(by1e: -shift)
+                if hi != 0 {
+                    // Truncated quotient is zero.
+                    residue = sm
+                    // If `hi > 1` or `lo >= residue`, then the complement,
+                    // which is notionally given by `(hi, lo) - residue`, must
+                    // exceed `UInt128.max` and thus must be greater than `residue`.
+                    if !truncating && hi == 1 && lo < residue {
+                        let complement = lo &- residue
+                        if residue > complement { // Truncated quotient isn't odd, since it's zero.
+                            residue = complement
+                            isNegative.toggle()
+                        }
+                    }
+                } else {
+                    if truncating {
+                        residue = sm % lo
+                    } else {
+                        let quotient: UInt128
+                        (quotient, residue) = sm.quotientAndRemainder(dividingBy: lo)
+                        let complement = lo - residue
+                        if residue > complement || (residue == complement && (quotient & 1) != 0) {
+                            residue = complement
+                            isNegative.toggle()
+                        }
+                    }
+                }
+            }
+        } else {
+            exponent = divisor._exponent
+            var quotient: UInt128
+            (quotient, residue) = sm.quotientAndRemainder(dividingBy: dm)
+            while shift > 0 && residue != 0 { // (Stopping when `residue == 0` can leave a stale `quotient`, but in that case we never test for quotient parity.)
+                let chunk = min(shift, 38)
+                (quotient, residue) = dm.dividingFullWidth(residue._multipliedFullWidth(by1e: chunk))
+                shift &-= chunk
+            }
+            if !truncating {
+                let complement = dm - residue
+                if residue > complement || (residue == complement && (quotient & 1) != 0) {
+                    residue = complement
+                    isNegative.toggle()
+                }
+            }
+        }
+
+        if residue == 0 {
+            return .zero
+        }
+        var result = Decimal()
+        result._significand = residue
+        result._isNegative = isNegative ? 1 : 0
+        result._exponent = exponent
+        result._isCompact = 0
+        result.compact()
+        return result
+    }
+}
+
 // MARK: - Numeric Values
 private extension Decimal {
     func _truncatingMagnitude() -> (result: Decimal, inexact: Bool) {
