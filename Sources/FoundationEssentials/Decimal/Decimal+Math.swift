@@ -247,6 +247,92 @@ extension UInt128 {
     }
 }
 
+extension Decimal {
+    internal func _squareRootReportingInexact(
+        minExponent: Int32 = Self._minExponent,
+        roundingMode: RoundingMode
+    ) throws(_CalculationError) -> (result: Decimal, inexact: Bool) {
+        guard !self.isNaN else {
+            throw .overflow
+        }
+        let sm = self._significand
+        guard self._length > 0 && sm != 0 else {
+            return (.zero, false)
+        }
+        // It's deliberate that we check `_isNegative` after we check `sm != 0`.
+        guard self._isNegative == 0 else {
+            throw .overflow
+        }
+
+        // Deliberately underestimate the max "headroom" for scaling up to 256 bits,
+        // using 1233/4096 as a close approximation of 1/log2(10) -- cf. Hacker's Delight, ch. 11.
+        var shift = ((128 &+ (sm|1).leadingZeroBitCount) &* 1233) &>> 12
+        // ...but in this case also preserve exponent parity:
+        shift &-= (shift &- Int(self._exponent)) & 1
+        var scaled: (high: UInt128, low: UInt128)
+        if shift > 38 {
+            let n: UInt128 = 100_000_000_000_000_000_000_000_000_000_000_000_000
+            scaled = sm.multipliedFullWidth(by: n)
+            let x = shift &- 38
+            let hi: UInt128
+            (hi, scaled.low) = scaled.low._multipliedFullWidth(by1e: x)
+            scaled.high = scaled.high._multipliedFullWidth(by1e: x).low + hi
+        } else {
+            scaled = sm.multipliedFullWidth(by: _uint128_pow10[shift])
+        }
+        // Top up our estimate, if needed.
+        let threshold: (high: UInt128, low: UInt128) = (
+            0x028f_5c28_f5c2_8f5c_28f5_c28f_5c28_f5c2,
+            0x8f5c_28f5_c28f_5c28_f5c2_8f5c_28f5_c28f
+        ) // UInt256.max / 100
+        if scaled <= threshold {
+            let hi: UInt128
+            (hi, scaled.low) = scaled.low.multipliedFullWidth(by: 100)
+            scaled.high = scaled.high * 100 + hi
+            shift &+= 2
+        }
+
+        let exponent = (self._exponent &- Int32(shift)) / 2
+        // Compute the significand.
+        let upperBound =
+            Double(UInt64(truncatingIfNeeded: scaled.high &>> 64)).nextUp
+                .squareRoot().nextUp * 0x1p96
+        var root: UInt128
+        var remainder: (high: UInt128, low: UInt128)
+        if upperBound >= 0x1p128 {
+            root = .max
+        } else {
+            // root = UInt128(upperBound)
+            let m = upperBound.significandBitPattern | 0x0010_0000_0000_0000
+            let shift = Int(upperBound.exponentBitPattern) &- 1075
+            root = UInt128(truncatingIfNeeded: m) &<< shift
+        }
+        while true {
+            let square = root.multipliedFullWidth(by: root)
+            if square <= scaled {
+                let borrow: Bool
+                (remainder.low, borrow) =
+                    scaled.low.subtractingReportingOverflow(square.low)
+                remainder.high = scaled.high &- square.high &- (borrow ? 1 : 0)
+                break
+            }
+            let quotient = root.dividingFullWidth(scaled).quotient
+            // root = floor((root + quotient) / 2), avoiding overflow.
+            root = (root &>> 1) &+ (quotient &>> 1) &+ (root & quotient & 1)
+        }
+
+        let tail: (numerator: UInt128, denominator: UInt128) =
+            remainder == (0, 0) ? (0, 1) : (remainder <= (0, root) ? (1, 3) : (2, 3))
+        return try Self._assemble(
+            isNegative: false,
+            significand: (0, root),
+            tail: tail,
+            exponent: exponent,
+            minExponent: minExponent,
+            roundingMode: roundingMode)
+    }
+}
+
 // MARK: - Mathematics
 extension Decimal {
     internal static let maxSize: UInt32 = 8
