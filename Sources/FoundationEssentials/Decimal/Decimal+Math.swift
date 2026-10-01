@@ -1282,3 +1282,209 @@ extension Decimal {
         return (result, inexact)
     }
 }
+
+extension Decimal {
+    internal func _addProductReportingInexact(
+        _ lhs: Decimal,
+        _ rhs: Decimal,
+        minExponent: Int32 = Self._minExponent,
+        roundingMode: RoundingMode
+    ) throws(_CalculationError) -> (result: Decimal, inexact: Bool) {
+        if self.isNaN || lhs.isNaN || rhs.isNaN {
+            throw .overflow
+        }
+        if lhs._length == 0 || rhs._length == 0 {
+            return try self._roundReportingInexact(
+                minExponent: minExponent,
+                roundingMode: roundingMode)
+        }
+
+        // Multiply.
+        let product: (high: UInt128, low: UInt128)
+        let lm = lhs._significand, rm = rhs._significand
+        if lm <= 0xffff_ffff_ffff_ffff && rm <= 0xffff_ffff_ffff_ffff {
+            let (hi, lo) = UInt64(truncatingIfNeeded: lm)
+                .multipliedFullWidth(by: UInt64(truncatingIfNeeded: rm))
+            product = (0, UInt128(truncatingIfNeeded: hi) &<< 64 | UInt128(truncatingIfNeeded: lo))
+        } else {
+            product = lm.multipliedFullWidth(by: rm)
+        }
+        if product == (0, 0) {
+            return try self._roundReportingInexact(
+                minExponent: minExponent,
+                roundingMode: roundingMode)
+        }
+        let productIsNegative = lhs._isNegative != rhs._isNegative
+        let productExponent = lhs._exponent + rhs._exponent
+        let sm = self._significand
+        if self._length == 0 || sm == 0 {
+            return try Self._assemble(
+                isNegative: productIsNegative,
+                significand: product,
+                exponent: productExponent,
+                minExponent: minExponent,
+                roundingMode: roundingMode)
+        }
+
+        // 256-bit addition.
+        var a = (
+            isNegative: productIsNegative,
+            significand: product,
+            exponent: productExponent,
+            shift: 0
+        )
+        var b = (
+            isNegative: self._isNegative != 0,
+            significand: (high: 0 as UInt128, low: sm),
+            exponent: self._exponent,
+            shift: 0
+        )
+        if a.exponent < b.exponent { swap(&a, &b) }
+        let exponentDifference = Int(a.exponent - b.exponent)
+
+        // Scale `a` significand as much as possible.
+        // Deliberately underestimate the max "headroom" for scaling up,
+        // using 1233/4096 as a close approximation of 1/log2(10) -- cf. Hacker's Delight, ch. 11.
+        let clz = (a.significand.high == 0)
+            ? 128 &+ (a.significand.low|1).leadingZeroBitCount
+            : (a.significand.high|1).leadingZeroBitCount
+        a.shift = min(exponentDifference, (clz &* 1233) &>> 12)
+        let x: Int
+        if a.shift > 38 {
+            let n: UInt128 = 100_000_000_000_000_000_000_000_000_000_000_000_000
+            let (hi, lo) = a.significand.low.multipliedFullWidth(by: n)
+            a.significand = (a.significand.high * n + hi, lo)
+            x = a.shift &- 38
+        } else {
+            x = a.shift
+        }
+        let (hi, lo) = a.significand.low._multipliedFullWidth(by1e: x)
+        let hi_ = a.significand.high._multipliedFullWidth(by1e: x).low + hi
+        a.significand = (hi_, lo)
+        // Top up our estimate, if needed.
+        let threshold: (high: UInt128, low: UInt128) = (
+            0x1999_9999_9999_9999_9999_9999_9999_9999,
+            0x9999_9999_9999_9999_9999_9999_9999_9999
+        ) // UInt256.max / 10
+        if a.shift < exponentDifference && a.significand <= threshold {
+            let (hi, lo) = a.significand.low.multipliedFullWidth(by: 10)
+            a.significand = (a.significand.high * 10 + hi, lo)
+            a.shift &+= 1
+        }
+        // `a.exponent` is stale now but won't be used further.
+
+        var commonExponent = a.exponent - Int32(a.shift)
+        b.shift = Int(commonExponent - b.exponent)
+        var numerator: UInt128 = 0
+        var denominator: UInt128 = 1
+
+        if b.shift == 0 {
+            denominator = 1
+            numerator = 0
+        } else if b.shift == 1 {
+            denominator = 10
+            let (q1, r1) =
+                b.significand.high._quotientAndRemainder(dividingBy1e: 1)
+            let (q2, r2) =
+                UInt128._quotientAndRemainder(
+                    fullWidth: (r1, b.significand.low),
+                    dividingBy1e: 1)
+            numerator = r2
+            b.significand = (q1, q2)
+        } else if b.shift < 78 {
+            denominator = 10
+            var sticky = false
+            var x = b.shift
+            while x > 38 {
+                let (q1, r1) =
+                    b.significand.high._quotientAndRemainder(dividingBy1e: 38)
+                let (q2, r2) =
+                    UInt128._quotientAndRemainder(
+                        fullWidth: (r1, b.significand.low),
+                        dividingBy1e: 38)
+                if r2 != 0 { sticky = true }
+                b.significand = (q1, q2)
+                x &-= 38
+            }
+            let (q1, r1) =
+                b.significand.high._quotientAndRemainder(dividingBy1e: x)
+            let (q2, r2) =
+                UInt128._quotientAndRemainder(
+                    fullWidth: (r1, b.significand.low),
+                    dividingBy1e: x)
+            if r2 != 0 { sticky = true }
+            numerator = sticky ? 1 : 0
+            b.significand = (q1, q2)
+        } else {
+            denominator = 10
+            numerator = 1
+            b.significand = (0, 0)
+        }
+        // `b.exponent` is stale now but won't be used further.
+
+        var significand: (high: UInt128, low: UInt128)
+        if a.isNegative == b.isNegative {
+            // Same sign: add magnitudes.
+            let (lo, carry1) =
+                a.significand.low.addingReportingOverflow(b.significand.low)
+            let (hi, carry2) =
+                a.significand.high.addingReportingOverflow(b.significand.high)
+            let (hi_, carry3) = hi.addingReportingOverflow(carry1 ? 1 : 0)
+            significand = (hi_, lo)
+            if carry2 || carry3 {
+                let (q1, r1) =
+                    UInt128._quotientAndRemainder(
+                        fullWidth: (1, significand.high),
+                        dividingBy1e: 1)
+                let (q2, r2) =
+                    UInt128._quotientAndRemainder(
+                        fullWidth: (r1, significand.low),
+                        dividingBy1e: 1)
+                significand = (q1, q2)
+                denominator = 10
+                numerator = (numerator != 0 || r2 != 0) ? 1 : 0
+                commonExponent += 1
+            }
+        } else if a.significand > b.significand {
+            let (lo, borrow) =
+                a.significand.low.subtractingReportingOverflow(b.significand.low)
+            let hi = a.significand.high - b.significand.high - (borrow ? 1 : 0)
+            significand = (hi, lo)
+            if numerator != 0 {
+                // We have a "negative" remainder, so we need to borrow.
+                let borrow: Bool
+                (significand.low, borrow) = significand.low.subtractingReportingOverflow(1)
+                if borrow { significand.high -= 1 }
+                numerator = denominator - numerator
+                // Restore a digit if necessary.
+                if significand.high == 0 {
+                    assert(b.shift == 1)
+                    let (hi, lo) = significand.low.multipliedFullWidth(by: 10)
+                    let (lo_, carry) = lo.addingReportingOverflow(numerator)
+                    significand = (hi + (carry ? 1 : 0), lo_)
+                    denominator = 1
+                    numerator = 0
+                    commonExponent -= 1
+                }
+            }
+        } else {
+            // If `b.shift > 0`, then `a.significand` has been scaled to exceed
+            // UInt256.max / 10 and `b.significand` must be less than that. So,
+            // if `b.significand >= a.significand`, then we know `b.shift == 0`
+            // and hence `numerator == 0`.
+            swap(&a, &b)
+            let (lo, borrow) =
+                a.significand.low.subtractingReportingOverflow(b.significand.low)
+            let hi = a.significand.high - b.significand.high - (borrow ? 1 : 0)
+            significand = (hi, lo)
+        }
+
+        return try Self._assemble(
+            isNegative: a.isNegative,
+            significand: significand,
+            tail: (numerator, denominator),
+            exponent: commonExponent,
+            minExponent: minExponent,
+            roundingMode: roundingMode)
+    }
+}
