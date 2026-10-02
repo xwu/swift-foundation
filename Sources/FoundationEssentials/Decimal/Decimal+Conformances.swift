@@ -300,7 +300,7 @@ extension Decimal /* : FloatingPoint */ {
 
         self = significand
         do {
-            self = try significand._multiplyByPowerOfTen(power: exponent, roundingMode: .plain)
+            self = try significand._multiplied(byPowerOfTen: exponent, rounding: .toNearestOrAwayFromZero)
         } catch _CalculationError.underflow {
             self = 0
             return
@@ -733,7 +733,7 @@ extension Decimal : SignedNumeric {
     ///   - rhs: Another value to add.
     public static func +=(lhs: inout Decimal, rhs: Decimal) {
         do {
-            let result = try lhs._add(rhs: rhs, roundingMode: .plain)
+            let result = try lhs._adding(rhs, rounding: .toNearestOrAwayFromZero)
             lhs = result
         } catch {
             lhs = .nan
@@ -752,7 +752,7 @@ extension Decimal : SignedNumeric {
     ///   - rhs: The value to subtract.
     public static func -=(lhs: inout Decimal, rhs: Decimal) {
         do {
-            let result = try lhs._subtract(rhs: rhs, roundingMode: .plain)
+            let result = try lhs._subtracting(rhs, rounding: .toNearestOrAwayFromZero)
             lhs = result
         } catch {
             lhs = .nan
@@ -771,7 +771,7 @@ extension Decimal : SignedNumeric {
     ///   - rhs: Another value to multiply.
     public static func *=(lhs: inout Decimal, rhs: Decimal) {
         do {
-            let result = try lhs._multiply(by: rhs, roundingMode: .plain)
+            let result = try lhs._multiplied(by: rhs, rounding: .toNearestOrAwayFromZero)
             lhs = result
         } catch _CalculationError.underflow {
             lhs = .zero
@@ -792,7 +792,7 @@ extension Decimal : SignedNumeric {
     ///   - rhs: The value to divide `lhs` by.
     public static func /=(lhs: inout Decimal, rhs: Decimal) {
         do {
-            let result = try lhs._divide(by: rhs, roundingMode: .plain)
+            let result = try lhs._divided(by: rhs, rounding: .toNearestOrAwayFromZero)
             lhs = result
         } catch _CalculationError.underflow {
             lhs = .zero
@@ -889,23 +889,7 @@ extension Decimal : Strideable {
     }
 }
 
-@available(macOS 10.10, iOS 8.0, watchOS 2.0, tvOS 9.0, *)
-extension Decimal.RoundingMode {
-    /// Round to the closest allowed value; if two values are equally close,
-    /// the one with greater magnitude is chosen.
-    ///
-    /// This rounding mode is also known as "schoolbook" or "plain" rounding.
-    @export(implementation)
-    public static var toNearestOrAwayFromZero: Self { .plain }
-
-    /// Round to the closest allowed value; if two values are equally close,
-    /// the even one is chosen.
-    ///
-    /// This rounding mode is also known as "bankers" rounding and is the
-    /// default IEEE 754 rounding mode for arithmetic.
-    @export(implementation)
-    public static var toNearestOrEven: Self { .bankers }
-}
+// MARK: - APIs inspired by FloatingPoint
 
 #if FOUNDATION_FRAMEWORK
 @available(anyAppleOS 10000, *)
@@ -948,8 +932,7 @@ extension Decimal {
         _significand = significandInteger
         _exponent = Int32(truncatingIfNeeded: Int8(exponent))
         _isNegative = sign == .plus ? 0 : 1
-        _isCompact = 0
-        compact()
+        _isCompact = _isActuallyCompact ? 1 : 0
     }
 }
 
@@ -979,10 +962,10 @@ extension Decimal {
     /// - Returns: The product of `lhs` and `rhs`, added to this value.
     public func addingProduct(_ lhs: Decimal, _ rhs: Decimal) -> Decimal {
         do {
-            return try self._addProductReportingInexact(
+            return try self._addingProductReportingInexact(
                 lhs,
                 rhs,
-                roundingMode: .bankers
+                rounding: .toNearestOrEven
             ).result
         } catch _CalculationError.underflow {
             return .zero
@@ -1152,17 +1135,6 @@ extension Decimal {
         }
     }
 
-    /// Rounds the value to an integral value using the specified rounding mode.
-    ///
-    /// For more information about the available rounding modes,
-    /// see the ``NSDecimalNumber/RoundingMode`` type.
-    ///
-    /// - Parameter mode: The rounding mode to use.
-    @inlinable
-    public mutating func round(mode: Decimal.RoundingMode) {
-        self = self.rounded(mode: mode)
-    }
-
     /// Rounds the value to an integral value using the specified rounding rule.
     ///
     /// For more information about the available rounding rules,
@@ -1176,23 +1148,6 @@ extension Decimal {
         self = self.rounded(rule)
     }
 
-    /// Returns this value rounded to an integral value using the specified rounding mode.
-    ///
-    /// For more information about the available rounding modes,
-    /// see the ``NSDecimalNumber/RoundingMode`` type.
-    ///
-    /// - Parameter mode: The rounding mode to use.
-    /// - Returns: The integral value found by rounding using `mode`.
-    public func rounded(mode: Decimal.RoundingMode) -> Decimal {
-        do {
-            return try self._roundReportingInexact(minExponent: 0, roundingMode: mode).result
-        } catch _CalculationError.underflow {
-            return .zero
-        } catch {
-            return .nan
-        }
-    }
-
     /// Returns this value rounded to an integral value using the specified rounding rule.
     ///
     /// For more information about the available rounding rules,
@@ -1203,17 +1158,13 @@ extension Decimal {
     public func rounded(
         _ rule: FloatingPointRoundingRule = .toNearestOrAwayFromZero
     ) -> Decimal {
-        let mode: RoundingMode =
-            switch rule {
-            case .toNearestOrAwayFromZero: .toNearestOrAwayFromZero
-            case .toNearestOrEven: .toNearestOrEven
-            case .up: .up
-            case .down: .down
-            case .towardZero: self < 0 ? .up : .down
-            case .awayFromZero: self < 0 ? .down : .up
-            @unknown default: fatalError("Unknown rounding rule")
-            }
-        return self.rounded(mode: mode)
+        do {
+            return try self._rounded(rule, minExponent: 0)
+        } catch _CalculationError.underflow {
+            return .zero
+        } catch {
+            return .nan
+        }
     }
 
     /// Returns the square root of the value, rounded to a representable value.
@@ -1221,7 +1172,7 @@ extension Decimal {
     /// - Returns: The square root of the value.
     public func squareRoot() -> Decimal {
         do {
-            return try self._squareRootReportingInexact(roundingMode: .bankers).result
+            return try self._squareRootReportingInexact(rounding: .toNearestOrEven).result
         } catch _CalculationError.underflow {
             return .zero
         } catch {
@@ -1250,33 +1201,34 @@ extension Decimal {
     }
 }
 
+@inline(always)
+private func _boundMinExponent(_ minExponent: Int) -> Int32 {
+    precondition(minExponent <= 165, "Minimum exponent must not exceed 165")
+    return Int32(max(minExponent, Int(Decimal._minExponent)))
+}
+
 @available(anyAppleOS 10000, *)
 extension Decimal {
-    @inline(always)
-    private static func _minExponent(scale: Int) -> Int32 {
-        max(Self._minExponent, -Int32(Int16(clamping: scale)))
-    }
-
     @inlinable
     public mutating func add(
         _ other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) {
-        self = self.adding(other, roundingMode: roundingMode, scale: scale)
+        self = self.adding(other, rounding: rule, minExponent: minExponent)
     }
 
     @inlinable
     @discardableResult
     public mutating func addReportingInexact(
         _ other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Bool {
         let addition = self.addingReportingInexact(
             other,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
         self = addition.result
         return addition.inexact
@@ -1284,14 +1236,14 @@ extension Decimal {
 
     public func adding(
         _ other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Decimal {
         do throws(_CalculationError) {
-            return try self._add(
-                rhs: other,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+            return try self._adding(
+                other,
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return .nan
@@ -1304,17 +1256,17 @@ extension Decimal {
 
     public func addingReportingInexact(
         _ other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> (result: Decimal, inexact: Bool) {
         if self.isNaN || other.isNaN {
             return (.nan, false)
         }
         do throws(_CalculationError) {
-            return try self._addReportingInexact(
-                rhs: other,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+            return try self._addingReportingInexact(
+                other,
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return (.nan, true)
@@ -1328,13 +1280,13 @@ extension Decimal {
     @inlinable
     public mutating func subtract(
         _ other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) {
         self = self.subtracting(
             other,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
     }
 
@@ -1342,13 +1294,13 @@ extension Decimal {
     @discardableResult
     public mutating func subtractReportingInexact(
         _ other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Bool {
         let subtraction = self.subtractingReportingInexact(
             other,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
         self = subtraction.result
         return subtraction.inexact
@@ -1356,14 +1308,14 @@ extension Decimal {
 
     public func subtracting(
         _ other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Decimal {
         do throws(_CalculationError) {
-            return try self._subtract(
-                rhs: other,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+            return try self._subtracting(
+                other,
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return .nan
@@ -1376,17 +1328,17 @@ extension Decimal {
 
     public func subtractingReportingInexact(
         _ other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> (result: Decimal, inexact: Bool) {
         if self.isNaN || other.isNaN {
             return (.nan, false)
         }
         do throws(_CalculationError) {
-            return try self._subtractReportingInexact(
-                rhs: other,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+            return try self._subtractingReportingInexact(
+                other,
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return (.nan, true)
@@ -1400,13 +1352,13 @@ extension Decimal {
     @inlinable
     public mutating func multiply(
         by other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) {
         self = self.multiplied(
             by: other,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
     }
 
@@ -1414,13 +1366,13 @@ extension Decimal {
     @discardableResult
     public mutating func multiplyReportingInexact(
         by other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Bool {
         let multiplication = self.multipliedReportingInexact(
             by: other,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
         self = multiplication.result
         return multiplication.inexact
@@ -1428,14 +1380,14 @@ extension Decimal {
 
     public func multiplied(
         by other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Decimal {
         do throws(_CalculationError) {
-            return try self._multiply(
+            return try self._multiplied(
                 by: other,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return .nan
@@ -1448,17 +1400,17 @@ extension Decimal {
 
     public func multipliedReportingInexact(
         by other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> (result: Decimal, inexact: Bool) {
         if self.isNaN || other.isNaN {
             return (.nan, false)
         }
         do throws(_CalculationError) {
-            return try self._multiplyReportingInexact(
+            return try self._multipliedReportingInexact(
                 by: other,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return (.nan, true)
@@ -1472,13 +1424,13 @@ extension Decimal {
     @inlinable
     public mutating func multiply(
         byPowerOfTen power: Int,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) {
         self = self.multiplied(
             byPowerOfTen: power,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
     }
 
@@ -1486,13 +1438,13 @@ extension Decimal {
     @discardableResult
     public mutating func multiplyReportingInexact(
         byPowerOfTen power: Int,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Bool {
         let multiplication = self.multipliedReportingInexact(
             byPowerOfTen: power,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
         self = multiplication.result
         return multiplication.inexact
@@ -1500,14 +1452,14 @@ extension Decimal {
 
     public func multiplied(
         byPowerOfTen power: Int,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Decimal {
         do throws(_CalculationError) {
-            return try self._multiplyByPowerOfTen(
-                power: power,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+            return try self._multiplied(
+                byPowerOfTen: power,
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return .nan
@@ -1520,17 +1472,17 @@ extension Decimal {
 
     public func multipliedReportingInexact(
         byPowerOfTen power: Int,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> (result: Decimal, inexact: Bool) {
         if self.isNaN {
             return (.nan, false)
         }
         do throws(_CalculationError) {
-            return try self._multiplyByPowerOfTenReportingInexact(
-                power: power,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+            return try self._multipliedReportingInexact(
+                byPowerOfTen: power,
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return (.nan, true)
@@ -1544,23 +1496,23 @@ extension Decimal {
     @inlinable
     public mutating func divide(
         by other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) {
-        self = self.divided(by: other, roundingMode: roundingMode, scale: scale)
+        self = self.divided(by: other, rounding: rule, minExponent: minExponent)
     }
 
     @inlinable
     @discardableResult
     public mutating func divideReportingInexact(
         by other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Bool {
         let division = self.dividedReportingInexact(
             by: other,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
         self = division.result
         return division.inexact
@@ -1568,14 +1520,14 @@ extension Decimal {
 
     public func divided(
         by other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Decimal {
         do throws(_CalculationError) {
-            return try self._divide(
+            return try self._divided(
                 by: other,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return .nan
@@ -1591,17 +1543,17 @@ extension Decimal {
 
     public func dividedReportingInexact(
         by other: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> (result: Decimal, inexact: Bool) {
         if self.isNaN || other.isNaN {
             return (.nan, false)
         }
         do throws(_CalculationError) {
-            return try self._divideReportingInexact(
+            return try self._dividedReportingInexact(
                 by: other,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return (.nan, true)
@@ -1619,14 +1571,14 @@ extension Decimal {
     public mutating func addProduct(
         _ lhs: Decimal,
         _ rhs: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) {
         self = self.addingProduct(
             lhs,
             rhs,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
     }
 
@@ -1635,14 +1587,14 @@ extension Decimal {
     public mutating func addProductReportingInexact(
         _ lhs: Decimal,
         _ rhs: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Bool {
         let addition = self.addingProductReportingInexact(
             lhs,
             rhs,
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
         self = addition.result
         return addition.inexact
@@ -1651,15 +1603,15 @@ extension Decimal {
     public func addingProduct(
         _ lhs: Decimal,
         _ rhs: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Decimal {
         do throws(_CalculationError) {
-            return try self._addProductReportingInexact(
+            return try self._addingProductReportingInexact(
                 lhs,
                 rhs,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             ).result
         } catch .overflow {
             return .nan
@@ -1673,18 +1625,18 @@ extension Decimal {
     public func addingProductReportingInexact(
         _ lhs: Decimal,
         _ rhs: Decimal,
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> (result: Decimal, inexact: Bool) {
         if self.isNaN || lhs.isNaN || rhs.isNaN {
             return (.nan, false)
         }
         do throws(_CalculationError) {
-            return try self._addProductReportingInexact(
+            return try self._addingProductReportingInexact(
                 lhs,
                 rhs,
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return (.nan, true)
@@ -1696,42 +1648,43 @@ extension Decimal {
     }
 
     @inlinable
-    public mutating func formSquareRoot(roundingMode: RoundingMode, scale: Int) {
-        self = self.squareRoot(roundingMode: roundingMode, scale: scale)
+    public mutating func formSquareRoot(
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
+    ) {
+        self = self.squareRoot(rounding: rule, minExponent: minExponent)
     }
 
     @inlinable
     @discardableResult
     public mutating func formSquareRootReportingInexact(
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Bool {
         let root = self.squareRootReportingInexact(
-            roundingMode: roundingMode,
-            scale: scale
+            rounding: rule,
+            minExponent: minExponent
         )
         self = root.result
         return root.inexact
     }
 
     @inlinable
-    public mutating func round(mode: Decimal.RoundingMode, scale: Int) {
-        self = self.rounded(mode: mode, scale: scale)
-    }
-
-    @inlinable
     public mutating func round(
-        _ rule: FloatingPointRoundingRule = .toNearestOrAwayFromZero,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) {
-        self = self.rounded(rule, scale: scale)
+        self = self.rounded(rounding: rule, minExponent: minExponent)
     }
 
-    public func rounded(mode: Decimal.RoundingMode, scale: Int) -> Decimal {
+    public func rounded(
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
+    ) -> Decimal {
         do throws(_CalculationError) {
-            return try self._roundReportingInexact(
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: mode
+            return try self._roundedReportingInexact(
+                rule,
+                minExponent: _boundMinExponent(minExponent)
             ).result
         } catch .overflow {
             return .nan
@@ -1742,28 +1695,14 @@ extension Decimal {
         }
     }
 
-    public func rounded(
-        _ rule: FloatingPointRoundingRule = .toNearestOrAwayFromZero,
-        scale: Int
+    public func squareRoot(
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> Decimal {
-        let mode: RoundingMode =
-            switch rule {
-            case .toNearestOrAwayFromZero: .toNearestOrAwayFromZero
-            case .toNearestOrEven: .toNearestOrEven
-            case .up: .up
-            case .down: .down
-            case .towardZero: self < 0 ? .up : .down
-            case .awayFromZero: self < 0 ? .down : .up
-            @unknown default: fatalError("Unknown rounding rule")
-            }
-        return self.rounded(mode: mode, scale: scale)
-    }
-
-    public func squareRoot(roundingMode: RoundingMode, scale: Int) -> Decimal {
         do throws(_CalculationError) {
             return try self._squareRootReportingInexact(
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             ).result
         } catch .overflow {
             return .nan
@@ -1775,16 +1714,16 @@ extension Decimal {
     }
 
     public func squareRootReportingInexact(
-        roundingMode: RoundingMode,
-        scale: Int
+        rounding rule: FloatingPointRoundingRule,
+        minExponent: Int
     ) -> (result: Decimal, inexact: Bool) {
         if self.isNaN || self < .zero {
             return (.nan, false)
         }
         do throws(_CalculationError) {
             return try self._squareRootReportingInexact(
-                minExponent: Decimal._minExponent(scale: scale),
-                roundingMode: roundingMode
+                rounding: rule,
+                minExponent: _boundMinExponent(minExponent)
             )
         } catch .overflow {
             return (.nan, true)
